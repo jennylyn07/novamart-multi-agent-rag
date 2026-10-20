@@ -584,13 +584,41 @@ def build_communication_agent() -> Agent:
     and composing a coherent, empathetic response.
     """
 
-    # TODO: Create a BedrockModel
-    pass
+    # Slightly higher temperature than the other workers: this is the only agent
+    # whose output is prose a customer reads, so natural wording is welcome.
+    model = BedrockModel(
+        model_id=config.WORKER_MODEL_ID,
+        region_name=config.AWS_REGION,
+        temperature=0.3,
+    )
 
-    # TODO: System prompt for the Communication Agent
-    pass
+    system_prompt = """You are the Communication Agent for NovaMart's customer support system.
+You are always the LAST agent in the workflow. You write the one message the customer will read.
 
-    # TODO: Implement get_full_workflow_context
+How to work:
+1. ALWAYS call get_full_workflow_context(session_id) first. It holds everything the other
+   agents found: inventory_agent (order and tier facts), policy_agent (policy text),
+   refund_agent (approved/denied decision and return reference).
+   Any of these may be missing: use only what is there.
+2. Write from those findings ONLY. Never invent order details, dates, amounts, policy
+   terms, reference numbers or decisions. If something the customer asked about is not in
+   the context, say you do not have that information and offer support@novamart.example.com
+   or 1-800-NOVA-456.
+3. If the refund decision is APPROVED: confirm it, include the return reference number
+   exactly as given, and explain the next steps (print the return label, pack, drop off,
+   refund in 5-7 business days).
+   If DENIED: say so kindly and clearly, give the real reason with the numbers (for example
+   days since order versus the window), and suggest an alternative if the policy offers one.
+   Never turn a denial into an approval to be nice.
+4. For policy questions, answer from the policy_agent text and mention the customer's
+   tier benefit when it is relevant.
+5. If the context contains no findings at all (for example a simple calculation or general
+   question), answer the customer's original request directly and briefly.
+6. Tone: warm, professional and concise. Address the customer by name only if the context
+   gives it. No internal details: never mention agents, tools, WorkflowState, DynamoDB or
+   session IDs. Plain text, no tables, under about 150 words unless the customer asked for detail.
+7. Output only the final customer message, nothing else."""
+
     @tool
     def get_full_workflow_context(session_id: str) -> dict:
         """
@@ -602,10 +630,18 @@ def build_communication_agent() -> Agent:
         Returns:
             Full WorkflowState dict (inventory_agent, policy_agent, refund_agent)
         """
-        pass
+        state = _read_workflow_state(session_id)
+        if not state:
+            return {}
+        # DynamoDB returns numbers as Decimal (version, ttl): convert so the
+        # result is clean JSON for the model.
+        return json.loads(json.dumps(state, default=lambda o: int(o) if o == int(o) else float(o)))
 
-    # TODO: Instantiate and return the Agent
-    pass
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[get_full_workflow_context],
+    )
 
 
 # ───────────────────────────────────────────────────────
