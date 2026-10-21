@@ -981,31 +981,107 @@ def create_guardrail() -> tuple[str, str]:
             print(f"Guardrail already exists: {guardrail_id} (version: {guardrail_version})")
             return guardrail_id, guardrail_version
 
-    # TODO: Create the guardrail
-    # Use bedrock_client.create_guardrail() with:
-    #   - name (config.GUARDRAIL_NAME) and description
-    #   - contentPolicyConfig - filtersConfig for SEXUAL, VIOLENCE, HATE at HIGH
-    #     strength and INSULTS, MISCONDUCT at MEDIUM strength (input + output)
-    #   - sensitiveInformationPolicyConfig - piiEntitiesConfig:
-    #       CREDIT_DEBIT_CARD_NUMBER and US_SOCIAL_SECURITY_NUMBER -> BLOCK
-    #       EMAIL and PHONE -> ANONYMIZE
-    #   - topicPolicyConfig - one DENY topic per entry in config.GUARDRAIL_BLOCKED_TOPICS
-    #     (competitor products, pricing negotiations, legal threats)
-    #     Use topicPolicyConfig.tierConfig = {'tierName': 'STANDARD'} and
-    #     top-level crossRegionConfig = {'guardrailProfileIdentifier': 'us.guardrail.v1:0'}.
-    #     Define pricing negotiations as haggling / changing an advertised price,
-    #     excluding arithmetic using an already-specified price and discount.
-    #     Classic-tier definitions tested in this project blocked the math scenario.
-    #     Validate allowed arithmetic (input and output) and blocked negotiation,
-    #     competitor and legal-threat requests. Keep all required safety policies.
-    #   - wordPolicyConfig - managedWordListsConfig with type PROFANITY
-    #   - blockedInputMessaging and blockedOutputsMessaging
-    #
-    # Then promote it from DRAFT to a numbered version with
-    # bedrock_client.create_guardrail_version(guardrailIdentifier=...)
-    # and return (guardrail_id, guardrail_version).
+    # One DENY topic per entry in config.GUARDRAIL_BLOCKED_TOPICS. Bedrock limits a topic
+    # definition to 200 characters and each example to 100.
+    topic_details = {
+        "competitor products": {
+            "definition": "Requests to compare NovaMart with, recommend, or buy from competing "
+                          "retailers, brands or their products.",
+            "examples": [
+                "Is Amazon cheaper than NovaMart for this laptop?",
+                "Which competitor sells better headphones than you?",
+            ],
+        },
+        "pricing negotiations": {
+            "definition": "Haggling over or asking to change an advertised NovaMart price, such as "
+                          "demanding a lower price or a special deal. Calculating totals or discounts "
+                          "from a price already given is NOT a negotiation.",
+            "examples": [
+                "Can you drop the price of this laptop if I buy two?",
+                "Give me a better deal or I will shop elsewhere.",
+            ],
+        },
+        "legal threats": {
+            "definition": "Threats of lawsuits, legal action, lawyers or regulator complaints against "
+                          "NovaMart, or requests for legal advice about suing.",
+            "examples": [
+                "I will sue NovaMart if you do not refund me today.",
+                "My lawyer will contact you about this order.",
+            ],
+        },
+    }
+    topics_config = []
+    for topic_name in config.GUARDRAIL_BLOCKED_TOPICS:
+        details = topic_details.get(topic_name, {
+            "definition": f"Conversations about {topic_name}, which NovaMart support does not handle.",
+            "examples": [],
+        })
+        topic = {'name': topic_name, 'definition': details['definition'], 'type': 'DENY'}
+        if details['examples']:
+            topic['examples'] = details['examples']
+        topics_config.append(topic)
 
-    pass
+    response = bedrock_client.create_guardrail(
+        name=config.GUARDRAIL_NAME,
+        description="NovaMart enterprise guardrail: harmful content, PII, off-topic subjects and profanity",
+        contentPolicyConfig={
+            'filtersConfig': [
+                {'type': 'SEXUAL',     'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'VIOLENCE',   'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'HATE',       'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'INSULTS',    'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+                {'type': 'MISCONDUCT', 'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+            ]
+        },
+        sensitiveInformationPolicyConfig={
+            'piiEntitiesConfig': [
+                {'type': 'CREDIT_DEBIT_CARD_NUMBER',   'action': 'BLOCK'},
+                {'type': 'US_SOCIAL_SECURITY_NUMBER',  'action': 'BLOCK'},
+                {'type': 'EMAIL',                      'action': 'ANONYMIZE'},
+                {'type': 'PHONE',                      'action': 'ANONYMIZE'},
+            ]
+        },
+        topicPolicyConfig={
+            'topicsConfig': topics_config,
+            # STANDARD tier understands the "arithmetic is not a negotiation" exclusion;
+            # the older CLASSIC tier blocked the math scenario.
+            'tierConfig': {'tierName': 'STANDARD'},
+        },
+        wordPolicyConfig={'managedWordListsConfig': [{'type': 'PROFANITY'}]},
+        blockedInputMessaging=(
+            "Sorry, I can't help with that request. For other questions, "
+            "contact support@novamart.example.com."
+        ),
+        blockedOutputsMessaging=(
+            "Sorry, I can't provide that response. For other questions, "
+            "contact support@novamart.example.com."
+        ),
+        # STANDARD tier runs through a cross-region guardrail profile.
+        crossRegionConfig={'guardrailProfileIdentifier': 'us.guardrail.v1:0'},
+    )
+    guardrail_id = response['guardrailId']
+    print(f"  Guardrail created: {guardrail_id} (DRAFT) - waiting until READY", end='', flush=True)
+
+    # A new guardrail starts as CREATING; a version can only be cut once it is READY.
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        status = bedrock_client.get_guardrail(guardrailIdentifier=guardrail_id).get('status')
+        if status == 'READY':
+            break
+        if status == 'FAILED':
+            raise RuntimeError(f"Guardrail {guardrail_id} creation failed")
+        print('.', end='', flush=True)
+        time.sleep(3)
+    print(' ready.')
+
+    # Promote DRAFT to an immutable numbered version (runtime and tests need a number).
+    version_response = bedrock_client.create_guardrail_version(
+        guardrailIdentifier=guardrail_id,
+        description="Initial published version",
+    )
+    guardrail_version = version_response['version']
+    print(f"  Guardrail version published: {guardrail_version}")
+    return guardrail_id, guardrail_version
 
 
 def deploy_to_agentcore_runtime(
@@ -1046,21 +1122,32 @@ def deploy_to_agentcore_runtime(
     # Stage the code the CLI packages (src modules + config.py + pyproject.toml).
     agentcore_cli.stage_runtime_code()
 
-    # TODO: Configure and deploy the runtime with the AgentCore CLI
-    # 1. Build the runtime environment variables dict `runtime_env` with:
-    #      AWS_REGION, PROJECT_NAME (config.AWS_REGION / config.PROJECT_NAME),
-    #      RETURNS_KB_ID, SHIPPING_KB_ID, WARRANTY_KB_ID (from config),
-    #      AGENT_LOG_GROUP (config.AGENT_LOG_GROUP), and the guardrail
-    #      (GUARDRAIL_ID = guardrail_id, GUARDRAIL_VERSION = guardrail_version)
-    # 2. Write the runtime settings to agentcore/agentcore.json with
-    #      agentcore_cli.configure_runtime(env_vars=runtime_env,
-    #                                      network_mode='PUBLIC',
-    #                                      protocol='HTTP',
-    #                                      execution_role_arn=config.AGENTCORE_ROLE_ARN)
-    # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
-    # 4. Read the ARN the CLI recorded:
-    #      runtime_arn = agentcore_cli.deployed_runtime_arn()
-    runtime_arn = None
+    # 1. Environment variables the deployed agent reads. The runtime has no .env file,
+    #    so everything config.py needs (KB IDs, log group, guardrail) goes in here.
+    runtime_env = {
+        'AWS_REGION':        config.AWS_REGION,
+        'PROJECT_NAME':      config.PROJECT_NAME,
+        'RETURNS_KB_ID':     config.RETURNS_KB_ID,
+        'SHIPPING_KB_ID':    config.SHIPPING_KB_ID,
+        'WARRANTY_KB_ID':    config.WARRANTY_KB_ID,
+        'AGENT_LOG_GROUP':   config.AGENT_LOG_GROUP,
+        'GUARDRAIL_ID':      guardrail_id,
+        'GUARDRAIL_VERSION': guardrail_version,
+    }
+
+    # 2. Write the runtime settings (network, protocol, role, env vars) to agentcore.json.
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN,
+    )
+
+    # 3. Package and deploy with `agentcore deploy -y`.
+    agentcore_cli.deploy()
+
+    # 4. The CLI records the runtime ARN it created.
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
         raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
@@ -1094,16 +1181,19 @@ def configure_memory(runtime_arn: str) -> str:
             print(f"AgentCore Memory already exists: {memory_arn}")
             return memory_arn
 
-    # TODO: Create AgentCore Memory
-    # Use agentcore_control.create_memory() with:
-    #   - name (memory_name) and a description
-    #   - eventExpiryDuration = 7   (days)
-    #   - memoryStrategies = [{'summaryMemoryStrategy': {
-    #         'name': 'SessionSummary',
-    #         'namespaces': ['/summaries/{actorId}/{sessionId}']}}]
-    #   - clientToken (e.g. str(uuid.uuid4())) for idempotency
-    # Store the API response in `response`.
-    response = None
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description="NovaMart session summaries for the multi-agent support system",
+        eventExpiryDuration=7,   # days that raw events are kept
+        memoryStrategies=[{
+            'summaryMemoryStrategy': {
+                'name': 'SessionSummary',
+                # one summary per actor (customer) per session
+                'namespaces': ['/summaries/{actorId}/{sessionId}'],
+            }
+        }],
+        clientToken=str(uuid.uuid4()),   # makes a retried call idempotent
+    )
 
     if response is None:
         raise NotImplementedError("configure_memory: create_memory() not implemented")
@@ -1141,18 +1231,25 @@ def configure_observability(runtime_arn: str) -> None:
                           sampling percentage; runtime env AGENT_TRACING_ENABLED /
                           AGENT_TRACE_SAMPLING_RATE
     """
-    # TODO: Build the logging configuration
-    # logging_configuration = {
-    #     'cloudWatchConfig': {'logGroupName': config.AGENT_LOG_GROUP,
-    #                          'logLevel': 'INFO', 'enabled': True},
-    #     'xRayConfig':       {'enabled': True, 'samplingRate': 1.0},
-    # }
-    # Then apply it:  summary = apply_observability_config(runtime_arn, logging_configuration)
-    # Wrap the call in try/except - on success print the CloudWatch log group
-    # and the X-Ray sampling rate; on exception print
-    #   "[Note] Observability configuration failed: <e>"
+    logging_configuration = {
+        'cloudWatchConfig': {
+            'logGroupName': config.AGENT_LOG_GROUP,
+            'logLevel': 'INFO',
+            'enabled': True,
+        },
+        'xRayConfig': {
+            'enabled': True,
+            'samplingRate': 1.0,   # 100%: every request is traced
+        },
+    }
 
-    pass
+    try:
+        summary = apply_observability_config(runtime_arn, logging_configuration)
+        print(f"  CloudWatch log group : {summary['log_group']}")
+        print(f"  X-Ray sampling rate  : {logging_configuration['xRayConfig']['samplingRate']:.0%}")
+    except Exception as e:
+        # Observability must never stop the deployment itself.
+        print(f"  [Note] Observability configuration failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════
