@@ -260,7 +260,7 @@ Rules:
             clean[key] = value
         return clean
 
-    # TODO: Implement check_order_status
+    # Tool: check_order_status
     # NOTE: the Orders table has a COMPOSITE key (customer_id = partition key,
     # order_id = sort key), so a get_item needs BOTH values. That is why this
     # tool takes customer_id as well as order_id.
@@ -289,7 +289,7 @@ Rules:
             }
         return _plain(item)
 
-    # TODO: Implement get_customer_tier
+    # Tool: get_customer_tier
     @tool
     def get_customer_tier(customer_id: str) -> dict:
         """
@@ -309,7 +309,7 @@ Rules:
             return {'found': False, 'message': f"No customer {customer_id} found."}
         return _plain(item)
 
-    # TODO: Implement list_customer_orders
+    # Tool: list_customer_orders
     @tool
     def list_customer_orders(customer_id: str) -> dict:
         """
@@ -658,8 +658,11 @@ How to work:
    Any of these may be missing: use only what is there.
 2. Write from those findings ONLY. Never invent order details, dates, amounts, policy
    terms, reference numbers or decisions. If something the customer asked about is not in
-   the context, say you do not have that information and offer support@novamart.example.com
-   or 1-800-NOVA-456.
+   the context, say you do not have that information and suggest contacting NovaMart's
+   customer support team.
+   Never write email addresses or phone numbers in your reply: the safety guardrail masks
+   them as {EMAIL} and {PHONE}, which would confuse the customer. Refer to "our customer
+   support team" instead, even if the context contains contact details.
 3. If the refund decision is APPROVED: confirm it, include the return reference number
    exactly as given, and explain the next steps (print the return label, pack, drop off,
    refund in 5-7 business days).
@@ -749,12 +752,26 @@ Call one tool at a time, in order, and call each worker at most once.
 Your final output is the text returned by route_to_communication_agent, word for word,
 with nothing added, removed or rephrased."""
 
-    # Shared by the four routing tools. The pattern from the TODO comments:
+    # Shared by the four routing tools. The pattern from the starter's comments:
     #   1. read the current WorkflowState (and remember its version)
     #   2. invoke the worker agent
     #   3. write the result back with optimistic locking
     def _run_worker(session_id: str, column: str, label: str,
                     worker: Agent, worker_prompt: str) -> str:
+        """
+        Run one worker agent and save its answer to WorkflowState.
+
+        Args:
+            session_id:    The current session identifier
+            column:        WorkflowState column to write (e.g. 'inventory_agent')
+            label:         Name shown in the terminal trace
+            worker:        The worker Agent to invoke
+            worker_prompt: The text sent to the worker
+
+        Returns:
+            The worker's answer as text, or an error message if the session
+            was never initialized
+        """
         state = _read_workflow_state(session_id)
         if not state:
             return (f"Error: session {session_id} has no WorkflowState. "
